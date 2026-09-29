@@ -9,8 +9,9 @@
 // 53053 — KeeneticOS refuses a loopback DNS server): a query
 // from Keenetic's DNS proxy goes out as DNS-over-HTTPS through a tunnel —
 // VLESS, WARP — or, with no tunnel up, straight. The provider sees neither the
-// question nor the answer and has nothing to block. The messages pass through
-// untouched: no cache, no parsing beyond the header, the DNS proxy does the rest.
+// question nor the answer and has nothing to block. The answers are kept for
+// their TTL (cache.go): names in use are refreshed ahead, and an expired
+// answer stands in while no way out answers; the DNS proxy does the rest.
 //
 // The DNS proxy itself stays (domain routing lives in it): the forwarder is
 // added to it as one more server ("ip name-server 192.168.1.1:53053", running
@@ -30,6 +31,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -67,6 +69,7 @@ type Settings struct {
 	Enabled   bool     `json:"enabled"`   // the router's DNS proxy asks nuxk
 	Via       string   `json:"via"`       // auto | vless | warp | direct
 	Resolvers []string `json:"resolvers"` // Catalog ids, in order of preference
+	Cache     bool     `json:"cache"`     // answers kept for their TTL (on unless turned off)
 }
 
 // Path is a way out: a tunnel's interface, or direct ("" iface).
@@ -96,6 +99,7 @@ type Options struct {
 	Hook      Hook                         // nil: not a Keenetic, nothing to attach to
 	Resolvers []Resolver                   // Catalog (tests replace it)
 	Transport func(Path) http.RoundTripper // tests: DoH without the internet
+	Clock     func() time.Time             // tests: time of their own
 }
 
 // PathStat: how one way out has been doing.
@@ -126,6 +130,7 @@ type Status struct {
 	LastPath  string     `json:"last_path,omitempty"`
 	Resolver  string     `json:"resolver,omitempty"` // the one that answered last
 	Paths     []PathStat `json:"paths"`
+	Cache     CacheStat  `json:"cache"`
 	Error     string     `json:"error,omitempty"`
 	Catalog   []Resolver `json:"catalog"`
 }
@@ -154,6 +159,12 @@ type Service struct {
 	lastPath  string
 	resolver  int // index into the resolver order that answered last
 
+	cache     *cache
+	fmu       sync.Mutex
+	inflight  map[string]*call // questions out to the resolvers now, by cache key
+	staleWait time.Duration
+	clock     func() time.Time
+
 	queries   atomic.Uint64
 	failed    atomic.Uint64
 	lastQuery atomic.Int64
@@ -176,12 +187,19 @@ func New(o Options, st Store) *Service {
 	if o.Paths == nil {
 		o.Paths = func() []Path { return nil }
 	}
+	if o.Clock == nil {
+		o.Clock = time.Now
+	}
 	s := &Service{
 		o: o, st: st,
-		set:     Settings{Via: ViaAuto},
-		clients: map[Path]*http.Client{},
-		stats:   map[string]*PathStat{},
-		sem:     make(chan struct{}, 64),
+		set:       Settings{Via: ViaAuto, Cache: true}, // what a saved file leaves out stays so
+		clients:   map[Path]*http.Client{},
+		stats:     map[string]*PathStat{},
+		cache:     newCache(),
+		inflight:  map[string]*call{},
+		staleWait: staleWait,
+		clock:     o.Clock,
+		sem:       make(chan struct{}, 64),
 	}
 	if st != nil {
 		_ = st.LoadJSON("dns", &s.set)
@@ -363,6 +381,11 @@ func (s *Service) answer(q []byte) []byte {
 		}
 		s.mu.Unlock()
 	}
+	if s.cacheOn() {
+		if key := cacheKey(q); key != "" {
+			return s.cached(key, q)
+		}
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	resp, _, err := s.resolve(ctx, q)
@@ -371,6 +394,115 @@ func (s *Service) answer(q []byte) []byte {
 		return ServFail(q)
 	}
 	return resp
+}
+
+// cached: from the cache while fresh; otherwise from the resolvers — and if
+// they don't answer in time (or fail), the expired answer: better than none.
+func (s *Service) cached(key string, q []byte) []byte {
+	now := s.clock()
+	e, fresh := s.cache.get(key, now)
+	if fresh {
+		s.cache.count(func(c *CacheStat) { c.Hits++ })
+		return e.reply(q, now, false)
+	}
+	s.cache.count(func(c *CacheStat) { c.Misses++ })
+	c := s.flight(key, q, false)
+	if c != nil {
+		var wait <-chan time.Time
+		if e != nil {
+			t := time.NewTimer(s.staleWait)
+			defer t.Stop()
+			wait = t.C
+		}
+		select {
+		case <-c.done:
+			if c.err == nil && (e == nil || c.resp[3]&0x0F != RcodeServFail) {
+				return own(c.resp, q)
+			}
+		case <-wait:
+		}
+	}
+	if e != nil {
+		s.cache.count(func(c *CacheStat) { c.Stale++ })
+		return e.reply(q, s.clock(), true)
+	}
+	s.failed.Add(1)
+	return ServFail(q)
+}
+
+type call struct {
+	done chan struct{}
+	resp []byte
+	err  error
+}
+
+// maxFlights: questions out to the resolvers at once, at most.
+const maxFlights = 64
+
+// flight asks the resolvers once for a question, however many ask meanwhile;
+// the answer goes to the cache. nil: too many out already.
+func (s *Service) flight(key string, q []byte, refresh bool) *call {
+	s.fmu.Lock()
+	defer s.fmu.Unlock()
+	if c := s.inflight[key]; c != nil {
+		return c
+	}
+	if len(s.inflight) >= maxFlights {
+		return nil
+	}
+	c := &call{done: make(chan struct{})}
+	s.inflight[key] = c
+	q = append([]byte(nil), q...)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		resp, _, err := s.resolve(ctx, q)
+		cancel()
+		if err == nil && s.cacheOn() {
+			if e := parseEntry(key, q, resp); e != nil {
+				s.cache.put(e, s.clock())
+				if refresh {
+					s.cache.count(func(c *CacheStat) { c.Refreshed++ })
+				}
+			}
+		}
+		c.resp, c.err = resp, err
+		s.fmu.Lock()
+		delete(s.inflight, key)
+		s.fmu.Unlock()
+		close(c.done)
+	}()
+	return c
+}
+
+// refresh asks again, in the background, for names in use about to expire:
+// the DNS proxy finds them fresh, and they're fresh should a tunnel drop.
+func (s *Service) refresh() {
+	if set := s.Settings(); !set.Enabled || !set.Cache {
+		return
+	}
+	s.mu.Lock()
+	on := s.udp != nil && !s.suspended
+	s.mu.Unlock()
+	if !on {
+		return
+	}
+	for _, e := range s.cache.due(s.clock(), 16) {
+		if s.flight(e.key, e.query, true) == nil {
+			return
+		}
+	}
+}
+
+func (s *Service) cacheOn() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.set.Cache
+}
+
+// FlushCache forgets every kept answer (the counters stay).
+func (s *Service) FlushCache() Status {
+	s.cache.flush()
+	return s.Status()
 }
 
 // order: the ways out to try, in turn — the chosen tunnel(s), then direct.
@@ -565,7 +697,8 @@ func doh(ctx context.Context, c *http.Client, r Resolver, q []byte) ([]byte, err
 
 // Run keeps the forwarder as the settings say: listening and attached while
 // on; every 30 s it checks that some way out answers — none does three
-// times running: taken back from the DNS proxy until one does again.
+// times running: taken back from the DNS proxy until one does again. Every
+// 5 s names in use about to expire are refreshed.
 func (s *Service) Run(ctx context.Context) {
 	if s.Settings().Enabled {
 		if err := s.start(); err != nil {
@@ -574,11 +707,16 @@ func (s *Service) Run(ctx context.Context) {
 	}
 	t := time.NewTimer(5 * time.Second)
 	defer t.Stop()
+	r := time.NewTicker(5 * time.Second)
+	defer r.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			s.stop() // the attachment stays: an update restarts the agent in seconds
 			return
+		case <-r.C:
+			s.refresh()
+			continue
 		case <-t.C:
 		}
 		s.tick(ctx)
@@ -735,12 +873,15 @@ func randID32() uint32 {
 func (s *Service) Settings() Settings {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.set
+	set := s.set
+	set.Resolvers = slices.Clone(set.Resolvers)
+	return set
 }
 
 // SetSettings: the panel's choice. Turning on: the forwarder must answer
 // through some way out, then it's added to the DNS proxy and the router must
-// still answer — otherwise nothing changes. Turning off takes it back.
+// still answer — otherwise nothing changes. Turning off takes it back and
+// forgets the cache, as does turning the cache off.
 func (s *Service) SetSettings(ctx context.Context, set Settings) (Status, error) {
 	was := s.Settings()
 	if set.Via == "" {
@@ -771,9 +912,13 @@ func (s *Service) SetSettings(ctx context.Context, set Settings) (Status, error)
 	case !set.Enabled && was.Enabled:
 		s.detach(ctx)
 		s.stop()
+		s.cache.flush()
 		s.mu.Lock()
 		s.set.Enabled, s.suspended, s.lastErr = false, false, ""
 		s.mu.Unlock()
+	}
+	if !set.Cache && was.Cache {
+		s.cache.flush()
 	}
 	if serr := s.save(); err == nil {
 		err = serr
@@ -828,6 +973,7 @@ func (s *Service) Status() Status {
 	}
 	s.mu.Unlock()
 	st.Queries, st.Failed, st.LastQuery = s.queries.Load(), s.failed.Load(), s.lastQuery.Load()
+	st.Cache = s.cache.stats()
 	st.CanAttach = s.o.Hook != nil
 	if !st.CanAttach {
 		st.Cannot = ErrNoHook.Error()

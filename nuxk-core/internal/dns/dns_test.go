@@ -56,7 +56,7 @@ func bigZone() []string {
 }
 
 // dohServer answers RFC 8484 POSTs from zone; it counts the questions.
-func dohServer(t *testing.T) (*httptest.Server, *int) {
+func dohServer(t *testing.T) (*httptest.Server, func() int) {
 	t.Helper()
 	n := 0
 	var mu sync.Mutex
@@ -82,7 +82,11 @@ func dohServer(t *testing.T) (*httptest.Server, *int) {
 		_, _ = w.Write(respond(q, ips...))
 	}))
 	t.Cleanup(srv.Close)
-	return srv, &n
+	return srv, func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return n
+	}
 }
 
 type failRT struct{}
@@ -164,10 +168,18 @@ func newService(t *testing.T, srv *httptest.Server, o Options) *Service {
 
 func ask(t *testing.T, network, server, name string) []byte {
 	t.Helper()
+	resp, err := askErr(network, server, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func askErr(network, server, name string) ([]byte, error) {
 	q, _ := Query(0x4242, name, TypeA)
 	c, err := net.DialTimeout(network, server, 2*time.Second)
 	if err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
@@ -175,29 +187,25 @@ func ask(t *testing.T, network, server, name string) []byte {
 		q = append(binary.BigEndian.AppendUint16(nil, uint16(len(q))), q...)
 	}
 	if _, err := c.Write(q); err != nil {
-		t.Fatal(err)
+		return nil, err
 	}
 	if network == "tcp" {
 		var l [2]byte
 		if _, err := io.ReadFull(c, l[:]); err != nil {
-			t.Fatal(err)
+			return nil, err
 		}
 		resp := make([]byte, binary.BigEndian.Uint16(l[:]))
-		if _, err := io.ReadFull(c, resp); err != nil {
-			t.Fatal(err)
-		}
-		return resp
+		_, err := io.ReadFull(c, resp)
+		return resp, err
 	}
 	buf := make([]byte, 4096)
 	n, err := c.Read(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return buf[:n]
+	return buf[:n], err
 }
 
 // A query in over UDP or TCP, out as DoH — through the tunnel if it's up,
-// straight when it isn't — and the asker's ID back in the answer.
+// straight when it isn't — and the asker's ID back in the answer (asked
+// again: from the cache).
 func TestForwarder(t *testing.T) {
 	srv, n := dohServer(t)
 	s := newService(t, srv, Options{Paths: func() []Path { return []Path{{Name: "vless", Iface: "opkgtun1"}} }})
@@ -212,8 +220,8 @@ func TestForwarder(t *testing.T) {
 		}
 	}
 	st := s.Status()
-	if st.Queries != 2 || st.LastPath != PathDirect || *n != 2 {
-		t.Fatalf("status %+v, doh asked %d", st, *n)
+	if st.Queries != 2 || st.LastPath != PathDirect || n() != 1 || st.Cache.Hits != 1 {
+		t.Fatalf("status %+v, doh asked %d (the second from the cache)", st, n())
 	}
 	var vless PathStat
 	for _, p := range st.Paths {
@@ -221,7 +229,7 @@ func TestForwarder(t *testing.T) {
 			vless = p
 		}
 	}
-	if !vless.Up || vless.Failed != 2 || !strings.Contains(vless.LastErr, "tunnel down") {
+	if !vless.Up || vless.Failed != 1 || !strings.Contains(vless.LastErr, "tunnel down") {
 		t.Fatalf("the tunnel was tried first: %+v", vless)
 	}
 

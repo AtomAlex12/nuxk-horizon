@@ -85,6 +85,7 @@ var Routes = []Route{
 	{"GET /api/v1/dns", false, func(d Deps) http.HandlerFunc { return d.handleDNS }},
 	{"PUT /api/v1/dns/settings", false, func(d Deps) http.HandlerFunc { return d.handleDNSSettings }},
 	{"POST /api/v1/dns/check", false, func(d Deps) http.HandlerFunc { return d.handleDNSCheck }},
+	{"POST /api/v1/dns/cache/flush", false, func(d Deps) http.HandlerFunc { return d.handleDNSCacheFlush }},
 }
 
 // maxBody bounds every request body (the largest is a full set of lists).

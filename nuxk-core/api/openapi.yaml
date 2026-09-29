@@ -549,8 +549,11 @@ paths:
         port 53053 — KeeneticOS refuses loopback DNS servers) that the
         router's DNS proxy asks once it's turned on: each query goes out as
         DNS-over-HTTPS through VLESS, then WARP, then straight — the
-        provider can neither see nor substitute the answer. Messages pass
-        through untouched; the DNS proxy (and its domain routing) stays.
+        provider can neither see nor substitute the answer. Answers are kept
+        for their TTL (`settings.cache`): names in use are refreshed ahead of
+        expiry, and while no way out answers (within 1.8 s) an answer that
+        expired within a day goes back with a 30 s TTL. The DNS proxy (and
+        its domain routing) stays.
       responses:
         "200":
           description: the state
@@ -567,8 +570,9 @@ paths:
         answer through some way out first, then it's added to the DNS proxy
         ("ip name-server <LAN address>:53053", running config only, never saved)
         and the router must still answer — otherwise it's taken back and
-        nothing changed. Turning off takes it back. An empty `via` or
-        `resolvers` keeps what's set.
+        nothing changed. Turning off takes it back. A field left out (or an
+        empty `via`, `resolvers`) keeps what's set; turning off — protection
+        or the cache — forgets the cache.
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: "#/components/schemas/DNSSettings" } } }
@@ -584,6 +588,17 @@ paths:
         "502":
           description: "dns_failed: no way out answered, the router refused, or it stopped answering (taken back)"
           content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+
+  /api/v1/dns/cache/flush:
+    post:
+      tags: [dns]
+      operationId: flushDNSCache
+      summary: Forget the kept answers — the next questions go to the resolvers
+      responses:
+        "200":
+          description: the state, the cache empty (its counters stay)
+          content: { application/json: { schema: { $ref: "#/components/schemas/DNSStatus" } } }
+        "401": { $ref: "#/components/responses/Error" }
 
   /api/v1/dns/check:
     post:
@@ -1023,11 +1038,12 @@ components:
 
     DNSSettings:
       type: object
-      required: [enabled, via, resolvers]
+      required: [enabled, via, resolvers, cache]
       properties:
         enabled: { type: boolean, description: the router's DNS proxy asks nuxk }
         via: { type: string, enum: [auto, vless, warp, direct], description: "auto: VLESS, then WARP, then straight; a tunnel falls back to straight while it's down" }
         resolvers: { type: array, items: { type: string }, description: "catalog ids, in order of preference" }
+        cache: { type: boolean, description: "answers kept for their TTL (on unless turned off)" }
 
     DNSResolver:
       type: object
@@ -1050,9 +1066,20 @@ components:
         rtt_ms: { type: number }
         last_error: { type: string }
 
+    DNSCache:
+      type: object
+      required: [entries, bytes, hits, misses, stale, refreshed]
+      properties:
+        entries: { type: integer }
+        bytes: { type: integer, description: "memory taken, roughly; 2 MB and 5000 answers at most" }
+        hits: { type: integer, description: answered from the cache }
+        misses: { type: integer, description: "not there (or expired): asked the resolvers" }
+        stale: { type: integer, description: "an expired answer handed back: no way out answered in time" }
+        refreshed: { type: integer, description: names in use refreshed ahead of expiry }
+
     DNSStatus:
       type: object
-      required: [settings, listen, running, attached, suspended, can_attach, queries, failed, consulted, paths, catalog]
+      required: [settings, listen, running, attached, suspended, can_attach, queries, failed, consulted, paths, cache, catalog]
       properties:
         settings: { $ref: "#/components/schemas/DNSSettings" }
         listen: { type: string }
@@ -1068,6 +1095,7 @@ components:
         last_path: { type: string }
         resolver: { type: string, description: the resolver that answered last }
         paths: { type: array, items: { $ref: "#/components/schemas/DNSPathStat" } }
+        cache: { $ref: "#/components/schemas/DNSCache" }
         error: { type: string }
         catalog: { type: array, items: { $ref: "#/components/schemas/DNSResolver" } }
 

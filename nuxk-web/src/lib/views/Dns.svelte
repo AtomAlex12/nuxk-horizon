@@ -4,11 +4,11 @@
   // router's DNS proxy asks nuxk, and nuxk asks the resolvers over DoH through
   // VLESS or WARP — the provider sees nothing to substitute or block.
   import { api, type DNSCheck, type DNSStatus, type DNSSettings } from '../api';
-  import { ago } from '../ui';
+  import { ago, fmtBytes, plural } from '../ui';
 
   let s = $state<DNSStatus | null>(null);
   let err = $state('');
-  let busy = $state<'' | 'toggle' | 'settings' | 'check'>('');
+  let busy = $state<'' | 'toggle' | 'settings' | 'cache' | 'flush' | 'check'>('');
   let check = $state<DNSCheck | null>(null);
   let extra = $state('');
 
@@ -70,6 +70,26 @@
     const next = cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id];
     if (next.length) void change('settings', { resolvers: next });
   }
+
+  async function flush() {
+    busy = 'flush';
+    err = '';
+    try {
+      s = await api.flushDnsCache();
+    } catch (e) {
+      err = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = '';
+    }
+  }
+
+  // how many questions the cache answered, of those that came to nuxk
+  const hitRate = $derived.by(() => {
+    const c = s?.cache;
+    if (!c || c.hits + c.misses === 0) return '';
+    const all = c.hits + c.misses;
+    return `${Math.round((c.hits / all) * 100)} % · ${c.hits} из ${all}`;
+  });
 
   async function runCheck() {
     busy = 'check';
@@ -135,6 +155,37 @@
         {#if s.last_path}<dt>ответил</dt><dd>{s.resolver || '—'} · {PATH[s.last_path] ?? s.last_path}</dd>{/if}
         <dt>адрес nuxk</dt><dd class="mono">{s.listen}</dd>
       </dl>
+      <div class="divider top"></div>
+      <div class="row top">
+        <b>Кэш ответов</b>
+        {#if s.settings.cache}<span class="chip ok">включён</span>{:else}<span class="chip">выключен</span>{/if}
+        <span class="spacer"></span>
+        <label class="res">
+          <input
+            type="checkbox"
+            checked={s.settings.cache}
+            disabled={!!busy}
+            onchange={() => s && change('cache', { cache: !s.settings.cache })}
+          />
+          запоминать
+        </label>
+        <button class="ghost sm" onclick={flush} disabled={!!busy || !s.cache.entries}>
+          {busy === 'flush' ? 'Очищаю…' : 'Очистить'}
+        </button>
+      </div>
+      <p class="hint top-s">
+        nuxk хранит ответ столько, сколько разрешил сервер, а часто нужные адреса обновляет заранее. Если туннели и DoH не
+        ответили за 2 секунды — отдаёт последний известный адрес (не старше суток), и открытые раньше сайты продолжают
+        работать. Проверка подмены кэш не использует.
+      </p>
+      {#if s.settings.cache}
+        <dl class="kv top-s">
+          <dt>в кэше</dt><dd>{plural(s.cache.entries, 'ответ', 'ответа', 'ответов')} · {fmtBytes(s.cache.bytes)}</dd>
+          <dt>из кэша</dt><dd>{hitRate || 'пока не было'}</dd>
+          <dt>обновлено заранее</dt><dd>{s.cache.refreshed}</dd>
+          <dt>выручил при сбое</dt><dd>{s.cache.stale}</dd>
+        </dl>
+      {/if}
     {/if}
   </section>
 
@@ -240,6 +291,9 @@
 <style>
   .top {
     margin-top: 12px;
+  }
+  .top-s {
+    margin-top: 6px;
   }
   .note {
     display: block;

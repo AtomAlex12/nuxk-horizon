@@ -486,7 +486,7 @@ export interface paths {
         };
         /**
          * Protected DNS — on or off, which way the questions go, how each way does
-         * @description A forwarder on the router (DNS_LISTEN; by default its LAN address, port 53053 — KeeneticOS refuses loopback DNS servers) that the router's DNS proxy asks once it's turned on: each query goes out as DNS-over-HTTPS through VLESS, then WARP, then straight — the provider can neither see nor substitute the answer. Messages pass through untouched; the DNS proxy (and its domain routing) stays.
+         * @description A forwarder on the router (DNS_LISTEN; by default its LAN address, port 53053 — KeeneticOS refuses loopback DNS servers) that the router's DNS proxy asks once it's turned on: each query goes out as DNS-over-HTTPS through VLESS, then WARP, then straight — the provider can neither see nor substitute the answer. Answers are kept for their TTL (`settings.cache`): names in use are refreshed ahead of expiry, and while no way out answers (within 1.8 s) an answer that expired within a day goes back with a 30 s TTL. The DNS proxy (and its domain routing) stays.
          */
         get: operations["dns"];
         put?: never;
@@ -507,10 +507,27 @@ export interface paths {
         get?: never;
         /**
          * Turn protected DNS on or off; the way out; the resolvers
-         * @description Turning on changes the router's DNS settings: the forwarder must answer through some way out first, then it's added to the DNS proxy ("ip name-server <LAN address>:53053", running config only, never saved) and the router must still answer — otherwise it's taken back and nothing changed. Turning off takes it back. An empty `via` or `resolvers` keeps what's set.
+         * @description Turning on changes the router's DNS settings: the forwarder must answer through some way out first, then it's added to the DNS proxy ("ip name-server <LAN address>:53053", running config only, never saved) and the router must still answer — otherwise it's taken back and nothing changed. Turning off takes it back. A field left out (or an empty `via`, `resolvers`) keeps what's set; turning off — protection or the cache — forgets the cache.
          */
         put: operations["setDNSSettings"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/dns/cache/flush": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Forget the kept answers — the next questions go to the resolvers */
+        post: operations["flushDNSCache"];
         delete?: never;
         options?: never;
         head?: never;
@@ -879,6 +896,8 @@ export interface components {
             via: "auto" | "vless" | "warp" | "direct";
             /** @description catalog ids, in order of preference */
             resolvers: string[];
+            /** @description answers kept for their TTL (on unless turned off) */
+            cache: boolean;
         };
         DNSResolver: {
             id: string;
@@ -896,6 +915,19 @@ export interface components {
             last_ok?: number;
             rtt_ms?: number;
             last_error?: string;
+        };
+        DNSCache: {
+            entries: number;
+            /** @description memory taken, roughly; 2 MB and 5000 answers at most */
+            bytes: number;
+            /** @description answered from the cache */
+            hits: number;
+            /** @description not there (or expired): asked the resolvers */
+            misses: number;
+            /** @description an expired answer handed back: no way out answered in time */
+            stale: number;
+            /** @description names in use refreshed ahead of expiry */
+            refreshed: number;
         };
         DNSStatus: {
             settings: components["schemas"]["DNSSettings"];
@@ -918,6 +950,7 @@ export interface components {
             /** @description the resolver that answered last */
             resolver?: string;
             paths: components["schemas"]["DNSPathStat"][];
+            cache: components["schemas"]["DNSCache"];
             error?: string;
             catalog: components["schemas"]["DNSResolver"][];
         };
@@ -1805,6 +1838,27 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+        };
+    };
+    flushDNSCache: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the state, the cache empty (its counters stay) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DNSStatus"];
+                };
+            };
+            401: components["responses"]["Error"];
         };
     };
     checkDNS: {

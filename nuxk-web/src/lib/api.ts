@@ -147,6 +147,7 @@ export const api = {
   dns: () => req<DNSStatus>('GET', v1('/dns')),
   setDns: (s: Partial<DNSSettings>) => req<DNSStatus>('PUT', v1('/dns/settings'), s),
   checkDns: (domains: string[] = []) => req<DNSCheck>('POST', v1('/dns/check'), { domains }),
+  flushDnsCache: () => req<DNSStatus>('POST', v1('/dns/cache/flush')),
 
   // controller only (404 when the UI is served by the agent itself)
   agent: () => req<AgentState>('GET', '/ctl/v1/agent'),

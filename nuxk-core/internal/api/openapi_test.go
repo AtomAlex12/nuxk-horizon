@@ -97,6 +97,7 @@ func TestOpenAPISchemasCoverJSONFields(t *testing.T) {
 		"DNSStatus":      dns.Status{},
 		"DNSCheckItem":   dns.CheckItem{},
 		"DNSCheck":       dns.Check{},
+		"DNSCache":       dns.CacheStat{},
 	} {
 		block := schemaBlock(t, spec, schema)
 		typ := reflect.TypeOf(v)

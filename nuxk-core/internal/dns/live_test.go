@@ -2,7 +2,10 @@ package dns
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,4 +62,75 @@ func TestLive(t *testing.T) {
 		t.Logf("  %-14s router %-8s %v %s | plain %-8s %v %s | truth %v", it.Domain,
 			it.RouterVerdict, it.Router, it.RouterNote, it.PlainVerdict, it.Plain, it.PlainNote, it.Truth)
 	}
+}
+
+// TestLiveCache: the forwarder with its cache against the real resolvers
+// (NUXK_DNS_LIVE=1, through NUXK_DNS_LIVE_IFACE if set): asked again — from
+// the cache, quicker, TTL counted down; the way out gone and the answers
+// expired — the old ones stand in within staleWait.
+func TestLiveCache(t *testing.T) {
+	if os.Getenv("NUXK_DNS_LIVE") == "" {
+		t.Skip("NUXK_DNS_LIVE not set")
+	}
+	iface := os.Getenv("NUXK_DNS_LIVE_IFACE")
+	clk := &clock{t: time.Now()}
+	var down atomic.Bool
+	s := New(Options{Listen: freeAddr(t), Clock: clk.Now, Paths: func() []Path {
+		if iface == "" {
+			return nil
+		}
+		return []Path{{Name: "warp", Iface: iface}}
+	}}, nil)
+	s.o.Transport = func(p Path) http.RoundTripper {
+		rt := s.transport(p)
+		return rtFunc(func(r *http.Request) (*http.Response, error) {
+			if down.Load() {
+				return nil, errors.New("outage")
+			}
+			return rt.RoundTrip(r)
+		})
+	}
+	if err := s.start(); err != nil {
+		t.Fatal(err)
+	}
+	defer s.stop()
+	names := []string{"cloudflare.com", "github.com", "www.youtube.com", "chatgpt.com", "rutor.info", "nxdomain-nuxk-check.example.com"}
+	for _, name := range names {
+		t0 := time.Now()
+		first := ask(t, "udp", s.o.Listen, name)
+		miss := time.Since(t0)
+		clk.Add(2 * time.Second)
+		t0 = time.Now()
+		again := ask(t, "udp", s.o.Listen, name)
+		hit := time.Since(t0)
+		a1, _ := Parse(first)
+		a2, _ := Parse(again)
+		t1, _ := ttlIn(first)
+		t2, _ := ttlIn(again)
+		t.Logf("%-32s rcode %d %v ttl %d→%d  miss %v hit %v", name, a1.Rcode, a1.Addrs, t1, t2,
+			miss.Round(time.Millisecond), hit.Round(100*time.Microsecond))
+		if a1.Rcode != a2.Rcode || len(a1.Addrs) != len(a2.Addrs) || (t1 > 2 && t2 > t1-2) {
+			t.Errorf("%s: the cache's answer differs: %+v / %+v, ttl %d→%d", name, a1, a2, t1, t2)
+		}
+	}
+	st := s.Status()
+	t.Logf("cache: %+v, last path %s", st.Cache, st.LastPath)
+
+	down.Store(true)
+	clk.Add(2 * time.Hour)
+	for _, name := range names[:5] {
+		t0 := time.Now()
+		resp := ask(t, "udp", s.o.Listen, name)
+		a, _ := Parse(resp)
+		ttl, _ := ttlIn(resp)
+		t.Logf("outage: %-18s rcode %d %v ttl %d in %v", name, a.Rcode, a.Addrs, ttl, time.Since(t0).Round(time.Millisecond))
+		if a.Rcode != RcodeNoError || len(a.Addrs) == 0 || ttl != staleTTL || time.Since(t0) > 3*time.Second {
+			t.Errorf("outage: %s: no stale answer", name)
+		}
+	}
+	down.Store(false)
+	if a, err := Parse(ask(t, "udp", s.o.Listen, "cloudflare.com")); err != nil || len(a.Addrs) == 0 {
+		t.Errorf("after the outage: %v %+v", err, a)
+	}
+	t.Logf("cache: %+v", s.Status().Cache)
 }

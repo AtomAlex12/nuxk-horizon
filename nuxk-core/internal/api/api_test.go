@@ -255,6 +255,18 @@ func TestDNSAPI(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"resolvers":["quad9","cloudflare"]`) {
 		t.Fatalf("settings: %d %s", w.Code, w.Body)
 	}
+	// what a body leaves out stays: turning the cache off keeps the way out
+	w = do(h, "PUT", "/api/v1/dns/settings", `{"cache":false}`, "127.0.0.1:1", "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"cache":false`) || !strings.Contains(w.Body.String(), `"via":"warp"`) {
+		t.Fatalf("cache off: %d %s", w.Code, w.Body)
+	}
+	w = do(h, "PUT", "/api/v1/dns/settings", `{"via":"direct"}`, "127.0.0.1:1", "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"cache":false`) || !strings.Contains(w.Body.String(), `"resolvers":["quad9","cloudflare"]`) {
+		t.Fatalf("via: %d %s", w.Code, w.Body)
+	}
+	if w := do(h, "POST", "/api/v1/dns/cache/flush", "", "127.0.0.1:1", ""); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"entries":0`) {
+		t.Fatalf("flush: %d %s", w.Code, w.Body)
+	}
 	off := NewRouter(Deps{Version: "t", Engines: reg, Hub: hub, Ctl: core.NewController(reg, st, hub, "t")})
 	if w := do(off, "GET", "/api/v1/dns", "", "127.0.0.1:1", ""); w.Code != http.StatusNotFound {
 		t.Fatalf("off: %d", w.Code)

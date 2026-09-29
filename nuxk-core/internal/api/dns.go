@@ -35,9 +35,11 @@ func (d Deps) handleDNSSettings(w http.ResponseWriter, r *http.Request) {
 	if d.dnsOff(w) {
 		return
 	}
-	var s dns.Settings
+	// what the body leaves out stays as it is: {"via":"warp"} doesn't turn protection off
+	s := d.DNS.Settings()
+	s.Resolvers = nil
 	if err := json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&s); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad_body", `want {"enabled":true,"via":"auto","resolvers":["cloudflare"]}`)
+		writeErr(w, http.StatusBadRequest, "bad_body", `want {"enabled":true,"via":"auto","resolvers":["cloudflare"],"cache":true}`)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
@@ -76,4 +78,13 @@ func (d Deps) handleDNSCheck(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
 	writeJSON(w, http.StatusOK, d.DNS.Check(ctx, in.Domains))
+}
+
+// handleDNSCacheFlush forgets the kept answers: the next questions go to the
+// resolvers.
+func (d Deps) handleDNSCacheFlush(w http.ResponseWriter, r *http.Request) {
+	if d.dnsOff(w) {
+		return
+	}
+	writeJSON(w, http.StatusOK, d.DNS.FlushCache())
 }
